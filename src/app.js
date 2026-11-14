@@ -1277,7 +1277,107 @@ async function generateImages() {
  *   taken when Generate was pressed. Jobs wait in a pool, so reading live
  *   state here would send settings the user changed after pressing Generate.
  */
+const OPENROUTER_IMAGES_URL = 'https://openrouter.ai/api/v1/images';
+const OPENROUTER_CHAT_URL = 'https://openrouter.ai/api/v1/chat/completions';
+
+function openRouterHeaders() {
+    return {
+        'Authorization': `Bearer ${state.apiKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': window.location.origin,
+        'X-Title': 'Imagen Internal Tool'
+    };
+}
+
+/**
+ * Image models are served by OpenRouter's dedicated Image API. The chat
+ * completions endpoint rejects them outright ("<model> is an image generation
+ * model and cannot be used with the chat/completions endpoint"), so the Image
+ * API is always tried first. A handful of older chat-style models only answer
+ * on chat/completions, so those get one fallback attempt.
+ */
 async function generateSingleImage(prompt, modelId, modelConfig, settings, meta = {}) {
+    try {
+        return await generateViaImageApi(prompt, modelId, modelConfig, settings, meta);
+    } catch (error) {
+        if (!error || !error.retryOnChat) throw error;
+        return await generateViaChatApi(prompt, modelId, modelConfig, settings, meta);
+    }
+}
+
+/**
+ * POST /api/v1/images — text-to-image and image-to-image in one call.
+ * Reference images go in `input_references`, sizing in `aspect_ratio` /
+ * `resolution`. Images come back base64-encoded in `data[]`.
+ */
+async function generateViaImageApi(prompt, modelId, modelConfig, settings, meta) {
+    const requestBody = { model: modelId, prompt };
+
+    if (settings.aspectRatio && settings.aspectRatio !== 'auto') {
+        requestBody.aspect_ratio = settings.aspectRatio;
+    }
+    // Only Gemini currently exposes an explicit resolution tier; the value is
+    // the same 1K/2K/4K label the size buttons store.
+    if (modelConfig.supportsImageSize) {
+        requestBody.resolution = settings.quality;
+    }
+    if (modelConfig.supportsImageInput) {
+        const references = (settings.references || [])
+            .filter(Boolean)
+            .slice(0, modelConfig.maxReferences || 3)
+            .map(url => ({ type: 'image_url', image_url: { url } }));
+        if (references.length) requestBody.input_references = references;
+    }
+
+    const post = (body) => fetch(OPENROUTER_IMAGES_URL, {
+        method: 'POST',
+        headers: openRouterHeaders(),
+        body: JSON.stringify(body)
+    });
+
+    let response = await post(requestBody);
+
+    if (!response.ok && [400, 422].includes(response.status)) {
+        // The catalogue does not expose which optional parameters each image
+        // model accepts (the general models endpoint only lists chat params),
+        // so a 400 here is usually an unsupported aspect_ratio/resolution.
+        // Retry once with just the prompt and references — those are accepted
+        // by every image model. Failed generations are never billed.
+        const { aspect_ratio, resolution, ...minimal } = requestBody;
+        response = await post(minimal);
+    }
+
+    if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        const error = new Error(errorData.error?.message || `API error: ${response.status}`);
+        // 404/405 means this model is not served by the Image API at all
+        // (chat-style models) — worth a single fallback attempt over chat.
+        error.retryOnChat = [404, 405].includes(response.status);
+        throw error;
+    }
+
+    const data = await response.json();
+    if (data.usage && Number.isFinite(data.usage.cost)) {
+        meta.cost = data.usage.cost;
+    }
+
+    const image = Array.isArray(data.data) ? data.data[0] : null;
+    if (!image) {
+        console.log('Image API Response:', JSON.stringify(data, null, 2));
+        throw new Error('No image in response. Check console for full API response.');
+    }
+    if (image.url) return image.url;
+    if (image.b64_json) {
+        const mimeType = image.media_type || 'image/png';
+        return `data:${mimeType};base64,${image.b64_json}`;
+    }
+
+    console.log('Image API Response:', JSON.stringify(data, null, 2));
+    throw new Error('No image in response. Check console for full API response.');
+}
+
+/** Chat/completions fallback for the few chat-style image models. */
+async function generateViaChatApi(prompt, modelId, modelConfig, settings, meta = {}) {
     // Build message content
     const content = [];
 
@@ -1329,14 +1429,9 @@ async function generateSingleImage(prompt, modelId, modelConfig, settings, meta 
         requestBody.aspect_ratio = settings.aspectRatio;
     }
 
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    const response = await fetch(OPENROUTER_CHAT_URL, {
         method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${state.apiKey}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': window.location.origin,
-            'X-Title': 'Imagen Internal Tool'
-        },
+        headers: openRouterHeaders(),
         body: JSON.stringify(requestBody)
     });
 
